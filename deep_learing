@@ -1,0 +1,795 @@
+import numpy as np
+import pandas as pd
+import pickle
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from keras.models import Sequential, load_model
+from keras.layers.core import Dense, Dropout
+from keras.layers import BatchNormalization, Activation
+from keras.utils import np_utils
+from keras.callbacks import ModelCheckpoint, EarlyStopping
+from keras import backend as K
+from keras import regularizers
+#import tensorflow as tf
+
+from collections import Counter
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler, MinMaxScaler, StandardScaler, LabelEncoder, OneHotEncoder
+from sklearn.metrics import accuracy_score, precision_score, recall_score, confusion_matrix, mean_squared_error
+from sklearn.model_selection import StratifiedKFold
+
+import scipy.stats as ss
+from math import trunc, log
+
+pd.set_option('display.unicode.ambiguous_as_wide', True)
+pd.set_option('display.unicode.east_asian_width', True)
+pd.set_option('display.width', 120)
+
+pd.set_option('display.max_columns', None)
+
+
+
+
+def get_train_data(df, test_ratio = 0.1, random_state = 43):
+  # 학습데이터의 일부를 validation data 로 분리하는 작업
+  df_Y = df['credit']   # target 값을 df_Y 로 분리
+  feature_columns = list(df.columns.difference(['credit']))  #나머지를 feature_columns 로 분리
+  df_X = df[feature_columns]
+  X_train, X_val, Y_train, Y_val = train_test_split(df_X, df_Y, 
+                                                    stratify=df_Y, test_size=test_ratio,
+                                                    random_state = random_state)
+  
+  # index 열 없애기
+  X_train = X_train.reset_index(drop = True)
+  X_val = X_val.reset_index(drop = True)
+  Y_train = Y_train.reset_index(drop = True)
+  Y_val = Y_val.reset_index(drop = True)
+
+  
+  # 분리한 결과 summary 출력
+  print("=== train set ===")
+  print("Feature: ", X_train.shape)
+  print("Target", Y_train.shape)
+  print(Y_train.value_counts(normalize = True))
+  print()
+  print("== validation set ==")
+  print("Feature: ", X_val.shape)
+  print("Target: ",Y_val.shape)
+  print(Y_val.value_counts(normalize = True))
+  #print(X_val)
+  
+  train_df = pd.concat([X_train, Y_train], axis = 1)  # train data 는 다시 X, Y 를 하나로 합침: 코드 다른 부분과 호환을 위해
+  #print(train_df)
+  return train_df, X_val, Y_val
+
+
+
+def data_preprocessing2(df):
+    # 기본 전처리
+    df.fillna('n/a', inplace=True) 
+    df.drop(columns = ['FLAG_MOBIL'], inplace=True)
+
+    # DAYS_EMPLOYED가 양수인 데이터는 Pensioner 중 미고용 상태인 사람들이므로 begin_month + 11년 에 해당하는 값을 넣어 줌
+    #df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].map(lambda x: 0 if x > 0 else x)
+    for i in range(len(df)):
+        if df.loc[i, 'DAYS_EMPLOYED'] > 0:
+          df.loc[i, 'DAYS_EMPLOYED'] = abs(df.loc[i, 'begin_month'] * 30 - 11*365.25)
+
+
+    # 음수값 -> 양수 변환
+    feats = ['DAYS_BIRTH', 'begin_month', 'DAYS_EMPLOYED']
+    for feat in feats:
+        df[feat]=np.abs(df[feat])
+
+    # begin_month 가 특정 범위인 경우만 남김 (이유: 시각화 참조)
+    #df = df[(df['begin_month'] > 0) & (df['begin_month'] < 13) ].reset_index()
+    #df = df[df['begin_month'] > 11].reset_index()
+    #df = drop_index(df)
+
+    # 초기조건 (month 0) 에 관한 정보를 주는 파생변수를 추가
+    #df['age_before_card'] = df['DAYS_BIRTH']/365.25 - df['begin_month']/12
+    #df['emp_before_card'] = df['DAYS_EMPLOYED']/365.25 - df['begin_month']/12
+    #df['incometotal_before_card'] = df['emp_before_card'] * df['income_total']
+    #df['yearlyincome_before_card'] = df['incometotal_before_card'] / df['age_before_card']
+    #df['incometotal_during_card'] = df['income_total'] * (df['begin_month']/12)
+    #df['avg_familyincometotal_during_card'] = df['incometotal_during_card'] / df['family_size']
+    #df['adult_familyincometotal_during_card'] = df['incometotal_during_card'] * (df['family_size'] - df['child_num']) 
+    #df['child_familyincometotal_during_card'] = df['adult_familyincometotal_during_card'] / (df['child_num'] + 1)
+
+
+    # 0등급과 1등급을 하나로 묶은 경우
+    #df['credit'].replace({0: 1, 2: 1}, inplace=True)
+    #print(df['credit'].value_counts())  
+
+    # 범주형 컬럼 drop
+    df.drop(columns=['car', 'reality', 'income_type'], inplace=True)
+    return
+
+
+def drop_index(dataframe):
+    # 인덱스 컬럼 삭제
+    dataframe.drop(columns = 'index', inplace = True)
+    return dataframe
+
+def scaling(data):
+    #------ MinMaxScaler() -------#
+    #print(data.dtypes)
+    num_columns = data.select_dtypes(include = ['number']).copy()  # dtype 이 object 인 컬럼만 모아서 새 dataframe 생성
+    num_columns.drop(columns = ['credit'], inplace= True)  # target인 credit 은 여기서 scale 하지 않을것이므로 drop
+    #print("numerical value columns: \n", num_columns)
+
+    trans = MinMaxScaler()    # MinMax 로 scaling
+    data_scaled = trans.fit_transform(num_columns.values)    
+
+    data[num_columns.columns] = data_scaled
+    #----------------------------#
+
+    #print(data.dtypes)
+
+    #------ 1 hot encoding-------#
+    object_col = []
+    for col in data.columns:
+        if data[col].dtype == 'object':
+            object_col.append(col)
+            
+    enc = OneHotEncoder()
+    enc.fit(data.loc[:,object_col])
+
+
+    data_onehot_df = pd.DataFrame(enc.transform(data.loc[:,object_col]).toarray(), 
+                  columns=enc.get_feature_names(object_col))
+    data.drop(object_col, axis=1, inplace=True)
+    data = pd.concat([data, data_onehot_df], axis=1)
+    #----------------------------#
+    return data
+
+def get_clf_eval(y_test, pred):   # 머신러닝 / 딥러닝 분류 학습 결과를 confusion matrix 로 출력하는 함수. 교재 p158 참고
+    confusion = confusion_matrix(y_test, pred)
+    accuracy = accuracy_score(y_test, pred)
+    precision = precision_score(y_test, pred)
+    recall = recall_score(y_test, pred)
+    print("오차 행렬")
+    print(confusion)
+    print(F'정확도: {accuracy}, 정밀도: {precision}, 재현율: {recall}')
+
+    
+def check_blank(dataframe, fill = 0):
+    print("Number of Blank Fields")
+    for i in dataframe.columns:
+        print(i, ": \t\t", dataframe[i].isnull().sum())
+    
+    if (fill == 1):
+        dataframe.fillna('n/a', inplace=True)
+        print("\nAfter filling null fields: ")
+        for i in dataframe.columns:
+            print(i, ": \t\t", dataframe[i].isnull().sum())
+            
+    return dataframe
+
+
+def check_duplicated_rows(dataframe, deletion = 0):
+    # deletion = 0 인 경우 데이터 변경 없이 중복치 개수만 확인
+    
+    mask = dataframe.duplicated(keep='first')
+    print("="*60)
+    print(F"Total Numbere of Rows:\t\t{len(dataframe)}")
+    print("Count of Unique Rows:\t\t", mask.value_counts()[False], '\t',
+          mask.value_counts(normalize = True)[False])
+    print("Count of Redundant Rows:\t", mask.value_counts()[True], '\t',
+          mask.value_counts(normalize = True)[True], '\n'+ "=" * 60)
+
+    #duplicatedrows = dataframe[mask]
+    
+    if (deletion == 1):    # deletion == 1 이면 단순히 unique rows 만 남긴 dataframe 을 return
+        dataframe.drop_duplicates(inplace = True)
+        dataframe.reset_index(drop = True, inplace = True)
+        
+    elif (deletion == 2):    # deletion == 2 이면 unique rows 만 남긴 후 중복회수를 'counts' 컬럼으로 추가한 dataframe 을 리턴
+    # value_counts 를 통해 중복되는 row 들이 몇회씩 중복되었는지 확인하고 그 회수를 새로운 컬럼 'counts' 로 추가
+        df_counted = pd.DataFrame(dataframe.value_counts())
+        df_counted.rename(columns = {df_counted.columns[-1]:'counts'}, inplace = True)  # 새로운 컬럼 이름을 'counts' 로지정
+
+        #파일을 저장했다가 다시 로드함으로서 1개의 행 내용 전체가 1개 컬럼에 입력되어 있던 것을 다시 복수 컬럼화
+        df_counted.to_csv("valuecounts.csv") 
+        df_counted = pd.read_csv("valuecounts.csv")
+        card_counts = df_counted.pop('counts')    # counts 컬럼을 끝에서 두번째 위치로 옮기기 위해 pop()
+        n_columns = len(df_counted.columns)
+        df_counted.insert(n_columns-1, 'counts', card_counts)   #counts 컬럼을 끝에서 두번째 위치에 추가 
+        df_counted.to_csv("valuecounts.csv")   # 컬럼이 재 정렬된 상태로 다시 저장
+        
+        print("Number of Non-Unique Rows: ", df_counted["counts"].sum())  # counting 이 제대로 되었는지 확인
+        print(df_counted)
+        return df_counted
+        
+    return dataframe
+
+def conditional_entropy(x,y):
+    # entropy of x given y
+    y_counter = Counter(y)
+    xy_counter = Counter(list(zip(x,y)))
+    total_occurrences = sum(y_counter.values())
+    entropy = 0
+    for xy in xy_counter.keys():
+        p_xy = xy_counter[xy] / total_occurrences
+        p_y = y_counter[xy[1]] / total_occurrences
+        entropy += p_xy * log(p_y/p_xy)
+    return entropy
+
+def theil_u(x,y):
+    s_xy = conditional_entropy(x,y)
+    x_counter = Counter(x)
+    total_occurrences = sum(x_counter.values())
+    p_x = list(map(lambda n: n/total_occurrences, x_counter.values()))
+    s_x = ss.entropy(p_x)
+    if s_x == 0:
+        return 1
+    else:
+        return (s_x - s_xy) / s_x
+
+
+def visualize_theilsu(dataframe):
+    # 숫자형 컬럼은 credit 을 제외하고 모두 없애기
+    numeric_columns = dataframe.select_dtypes(include = ['number']).copy() 
+    numeric_columns.drop(columns = ['credit', 'email', 'phone', 'work_phone'], inplace = True) #이들 컬럼은 숫자형이지만 빼지 않음
+    df = dataframe.drop(columns = numeric_columns)
+
+    # Theil's U 계산
+    #결과를 넣을 dataframe 만들기
+    n_columns = len(df.columns)
+    result_T = pd.DataFrame(index = df.columns, columns = df.columns).astype(float)
+
+    #theil_u 함수를 모든 경우의 수에 대해 돌리면서 result_C 에 값 채워 넣기
+    for i in range(n_columns):
+        for j in range(n_columns):
+            result_T.iloc[j, i] = theil_u(df.iloc[:, i], df.iloc[:, j])
+    #result_C.to_csv("Cramers_V_corr.csv")
+
+    result_T.fillna(value=np.nan,inplace=True)
+    plt.figure(figsize=(15,15))
+    sns.heatmap(result_T,annot=True,fmt='.2f')
+    plt.show()
+    return
+
+
+def check_outliers(col_data):
+    # basic statistics
+    print(col_data.describe())
+    
+    # outlier detection
+    print("- Outlier Detection: ")
+    sns.boxplot(data = col_data, orient = 'h')
+    plt.show()
+    IQR = col_data.quantile(0.75) - col_data.quantile(0.25)
+    low_threshold = col_data.quantile(0.25) - IQR
+    high_threshold = col_data.quantile(0.75) + IQR
+    outliers = col_data[col_data > high_threshold]
+    print(outliers)
+    return
+
+def visualize_numerical_corr(dataframe):
+    # 'credit' 컬럼이 제일 끝으로 오도록 재배치
+    df = dataframe.copy()
+    credit = df.pop('credit')
+    df.insert(len(df.columns), 'credit', credit.values)
+
+    # numerical value 를 갖는 컬럼들 간의 상관계수
+    plt.figure(figsize=(15,15))
+    corr = df.corr()
+    corr.to_csv("corr_heatmap.csv")
+    #print(corr.dtypes)
+    plt.title("numerical columns correlation")
+    sns.heatmap(corr, cmap='RdBu', xticklabels=True, yticklabels=True, linewidth=1, linecolor='lightgray', annot=True, fmt='.2f') # annot=True, fmt='.2g'를 넣으면 숫자가 표시됨. # heatmap 은 숫자형 자료에만 적용 됨
+    #sns.pairplot(dataframe, hue='credit') #속성별 연관성 파악. pairplot 에서는 categorical data 도 사용 가능
+    #plt.savefig('numerical_corr.png', dpi=200, bbox_inches='tight')
+    plt.show()
+    return
+
+def visualize_categorical_corr(dataframe):
+    # cramers_v 를 계산하기 위한 함수 속 함수
+    def cramers_v(x, y):
+        confusion_matrix = pd.crosstab(x,y)
+        chi2 = ss.chi2_contingency(confusion_matrix)[0]
+        n = confusion_matrix.sum().sum()
+        phi2 = chi2/n
+        r,k = confusion_matrix.shape
+        phi2corr = max(0, phi2-((k-1)*(r-1))/(n-1))
+        rcorr = r-((r-1)**2)/(n-1)
+        kcorr = k-((k-1)**2)/(n-1)
+        return np.sqrt(phi2corr/min((kcorr-1),(rcorr-1)))
+    
+    #결과를 넣을 dataframe 만들기
+    n_columns = len(dataframe.columns)
+    result_C = pd.DataFrame(index = dataframe.columns, columns = dataframe.columns).astype(float)
+    
+    #cramers_v 함수를 모든 경우의 수에 대해 돌리면서 result_C 에 값 채워 넣기
+    for i in range(n_columns):
+        for j in range(n_columns):
+            result_C.iloc[j, i] = cramers_v(dataframe.iloc[:, i], dataframe.iloc[:, j])
+    result_C.to_csv("Cramers_V_corr.csv")
+    print(result_C.dtypes)
+    
+    #cramers_v 시각화
+    plt.figure(figsize=(9,9))
+    plt.title("Cramer's V correlation of columns (for categorical values) with card_counts")
+    sns.heatmap(result_C, cmap='Purples', xticklabels=True, yticklabels=True, linewidth=1, linecolor='lightgray', annot=True, fmt='.2f') #를 넣으면 숫자가 표시됨. # heatmap 은 숫자형 자료에만 적용 됨
+    plt.savefig('Cramers_V_corr.png', dpi=200, bbox_inches='tight')
+    plt.show()
+
+    return
+
+def visualize_mixed_corr(categories, measurement):
+    fcat, _ = pd.factorize(categories)
+    cat_num = np.max(fcat)+1
+    y_avg_array = np.zeros(cat_num)
+    n_array = np.zeros(cat_num)
+    for i in range(0,cat_num):
+        cat_measures = measurements[np.argwhere(fcat == i).flatten()]
+        n_array[i] = len(cat_measures)
+        y_avg_array[i] = np.average(cat_measures)
+    y_total_avg = np.sum(np.multiply(y_avg_array,n_array))/np.sum(n_array)
+    numerator = np.sum(np.multiply(n_array,np.power(np.subtract(y_avg_array,y_total_avg),2)))
+    denominator = np.sum(np.power(np.subtract(measurements,y_total_avg),2))
+    if numerator == 0:
+        eta = 0.0
+    else:
+        eta = np.sqrt(numerator/denominator)
+    return eta
+
+def label_encoding(dataframe):
+    print(dataframe.dtypes)
+    
+    column_names = dataframe.columns
+    n_columns = len(column_names)
+    object_columns = dataframe.select_dtypes(include = ['object']).copy()  # dtype 이 object 인 컬럼만 모아서 새 dataframe 생성
+    object_loc = []  # dtype 이 object 인 컬럼의 컬럼 위치만 모으기 위한 list 객체 생성
+    
+    for i in object_columns.columns:   #object_columns 의 컬럼 이름을 iteration 객체로 사용
+        loc = column_names.get_loc(i)
+        object_loc.append(loc)
+        
+    #print(object_loc)
+    
+    # dtype 이 object 인 컬럼만 찾아서 label encoding 하고 나머지 컬럼은 그대로 두기
+    dataset = dataframe.values
+    for i in object_loc:
+        e = LabelEncoder()
+        e.fit(dataset[:, i])
+        dataset[:, i] = e.transform(dataset[:, i])        
+    
+    
+    # label encoding 완료한 numpy 객체를 다시 dataframe 으로 만들기
+    labeled_df = pd.DataFrame(dataset, columns = column_names).astype(float)
+    print(labeled_df.dtypes)
+    print(labeled_df)
+    
+    return labeled_df
+
+def one_hot_encoding(dataframe):
+    # target 컬럼이 우측 끝에 있다고 가정하고, one-hot-encoding 후 동 컬럼이 우측 끝에 오게 하기 위해 관련 정보를 먼저 확인
+    target_column_name = dataframe.columns[-1]
+    
+    # 모든 caterical value 컬럼들을 one hot encoding 한 신규컬럼들로 대체
+    encoded_df = pd.get_dummies(dataframe)
+    
+    # 미리 확인 한 target 컬럼을 우측 끝으로 다시 보내기
+    n_columns = len(encoded_df.columns)   # 우측 끝 열의 위치를 확인하기 위해 컬럼 수 파악
+    target_column = encoded_df.pop(target_column_name)   #현재 위치에서 target column 을 없애면서 이를 별도 df 로 저장
+    encoded_df.insert(n_columns-1, target_column_name, target_column)    # 저장한 target column 을 우측 끝에 추가
+    
+    #display(encoded_df)
+    return encoded_df
+
+
+def display_confusion_matrix(y_true, y_pred, labels):
+    from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+    cm = confusion_matrix(y_true, y_pred, normalize='true')
+    disp = ConfusionMatrixDisplay(cm, display_labels = labels)
+    disp.plot()
+    plt.show()
+
+    cm2 = confusion_matrix(y_true, y_pred)
+    disp2 = ConfusionMatrixDisplay(cm2, display_labels = labels)
+    disp2.plot(values_format = '')
+    plt.show()
+
+
+def display_result(y_true, y_pred):
+    accuracy = accuracy_score(y_true, np.round(y_pred), normalize = False)  # accuracy 측정을 위해 Y_pred 를 반올림
+    print("정확히 예측한 개수: ", accuracy)
+    print("정확히 예측한 비율: ", accuracy / len(y_true))    
+    
+    #confusion matrix 그리기
+    display_confusion_matrix(y_true, np.round(y_pred), labels = ['credit 0', 'credit 1', 'credit 2'])
+
+    # 실제값 대비 예측값의 분포를 시각화
+    comparison = pd.concat([pd.Series(y_true), pd.Series(y_pred)], axis=1)
+    comparison.columns = ["Y_True", 'Y_Predicted']
+    comparison.sort_values('Y_True', inplace=True)   # 그래프로 표시 했을 때 보기 편하게 하기 위해 y_true 를 0->2 로 sort
+    comparison.reset_index(inplace = True)   # index 를 다시 numbering
+    
+    sns.scatterplot(data = comparison, x = comparison.index, y = 'Y_Predicted', color = 'orange', s = 3)
+    sns.scatterplot(data = comparison, x = comparison.index, y = 'Y_True', color = 'green', s = 3)
+    plt.show()  
+    
+    return
+
+
+
+def train_model(dataframe, model_type):
+    # 본 함수에서는 model 값으로 받은 인자에 따라 선택된 모델을 학습 후 결과를 보여줌
+    # model_type 인자가 없는 경우: error 발생
+    # model_type = "decision tree": Decision Tree 로 학습 후 결과 출력
+    # model_type = "deep classification": Deep Learning 을 Classification 형태로 학습 (출력 layer: softmax)
+    # model_type = "deep value": Deep Learning 을 선형 회귀 형태로 학습
+
+    
+    n_columns = len(dataframe.columns)
+    n_features = n_columns - 1
+    
+    if (model_type == "deep classification"):
+    # Deep Learning 을 활용해 '분류' 형태로 학습
+        # feature 와 target 을 분리 (target column의 이름이 'credit' 이라고 전제)
+        Y_obj = df.pop('credit').values
+        X = df.values.astype(float)
+           
+            
+            #model.add(Dense(56, input_dim=n_features, activation='relu'))
+                            #kernel_regularizer=regularizers.l2(0.001)))
+                            #kernel_initializer = 'he_uniform' ))   #입력층. feature 수 = 56 (1-hot 기준)
+            #model.add(BatchNormalization())
+            #model.add(Dropout(0.1))
+            #model.add(Dense(100, activation='relu'))
+                            #kernel_regularizer=regularizers.l2(0.001)))
+                            #kernel_initializer = 'he_uniform'))   #은닉층 N > input_dim 이 되도록 설정
+            #model.add(BatchNormalization())
+            #model.add(Dropout(0.1))
+            #model.add(Dense(6, activation = 'relu'))
+                            #kernel_regularizer=regularizers.l2(0.001)))
+                            #kernel_initializer = 'he_uniform'))  # 두번째 은닉층
+            #model.add(BatchNormalization())
+            #model.add(Dropout(0.1))
+
+        # 노드 설계
+        model = Sequential() # 모델의 설정
+
+        model.add(Dense(36, input_dim=n_features))
+        #model.add(BatchNormalization())
+        model.add(Activation('relu'))
+        model.add(Dropout(0.1))
+
+        model.add(Dense(20))
+        #model.add(BatchNormalization())
+        #model.add(Activation('relu'))
+        #model.add(Dropout(0.1))
+
+        #model.add(Dense(42))
+        #model.add(BatchNormalization())
+        model.add(Activation('relu'))
+       # model.add(Dropout(0.1))
+
+        model.add(Dense(3, activation='softmax'))  # 3개의 target class 0, 1, 2 각각에 속할 확률을 출력하는 layer
+        # 모델 컴파일(다중 분류에 적절한 오차 함수인 categorical_crossentropy를 사용, 최적화 함수로 adam 사용)
+        model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+        
+        # 모델 실행
+        history = model.fit(X, Y_obj, epochs=300, batch_size=64, verbose=1,
+                            validation_data = (validation_X, validation_Y))
+
+
+        print(model.summary())
+        #print("metric_names: ", model.metrics_names) #model.evaluate 이 return 하는 내용 확인    
+                
+        #print("history.history.keys()", history.history.keys())
+        
+        # 학습 결과 확인: 2. model.predict 사용 및 epoch 을 X축으로 하여 진행상황 시각화
+        Y_pred = model.predict(X)
+        Y_pred = np.argmax(Y_pred, axis = 1)   # [[0.1, 0.2, 0.7], [0.3,0 .3, 0.6]] 과 같이 확률로 된 결과를 argmax 에 따라 클래스를 정하고 1차원 list 로 변환
+
+        # 0. 학습 history 시각화 (loss vs val_loss) & (accuracy vs val_accuracy)
+        fig, loss_ax = plt.subplots()
+
+        acc_ax = loss_ax.twinx()
+
+        loss_ax.plot(history.history['loss'], 'r', label = 'train loss')
+        loss_ax.plot(history.history['val_loss'], 'b', label = 'validation loss')
+        
+        acc_ax.plot(history.history['accuracy'], 'y', label = 'train acc')
+        acc_ax.plot(history.history['val_accuracy'], 'g', label = 'val acc')
+
+        loss_ax.set_xlabel('epoch')
+        loss_ax.set_ylabel('loss')
+        acc_ax.set_ylabel('accuracy')
+
+        acc_ax.legend(bbox_to_anchor=(1.12,1), loc = 'upper left')
+        loss_ax.legend(bbox_to_anchor=(1.12,0), loc='lower left')
+
+        plt.show()
+        
+        # 1. validation set 에 대한 예측 결과 분석
+        Y_pred = model.predict(validation_X)
+        Y_pred = np.argmax(Y_pred, axis = 1).flatten()
+        print("************ Test Set 에 대한 예측 결과 ************")
+        display_result(validation_Y, Y_pred)
+
+
+        # 2. 학습 세트에 대한 예측 결과 분석
+        Y_pred = model.predict(X)
+        Y_pred = np.argmax(Y_pred, axis = 1).flatten()
+        print("************ 학습 데이터 에 대한 예측 결과 ************")
+        display_result(Y_obj, Y_pred) 
+
+
+
+
+        #추가 시각화
+        plt.rcParams['figure.figsize'] = (4, 3)
+        plt.rcParams['font.size'] = 12
+        acc_over_epochs = history.history['accuracy']
+        plt.plot(acc_over_epochs, c='red')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.show()
+
+        #학습된 모델을 파일로 저장 (deep learning 모델이 커서 pickle 저장이 안 되어 대신 .h5 로 저장)
+        filename = model_type + "_finalized_model.h5"
+        model.save(filename)
+
+    elif (model_type == "deep value"):
+    #Deep Learning 을 사용해 회귀 형태로 'value' 를 예측 (0 -2 사이 값을 도출)
+        # feature 와 target 을 분리 (target column의 이름이 'credit' 이라고 전제)
+        Y_obj = df.pop('credit').values
+        X = df.values.astype(float)
+        #Y_obj = Y_obj / 2   # max 값이 2 로 나눔으로서 min-max scaling
+        #Y_obj = Y_obj + 1    # mean_absolute_percentage_error 를 사용하기 위해 0 - 2 등급을 1 - 3으로 조정 (0이 있어서는 안됨)
+        
+        def custom_activation(x):           # output 값을 0 - 2  등 일정 간격으로 만들기 위한 custom activation function
+            activated_x = K.tanh(x) + 1  
+            return activated_x
+        
+        def custom_loss(y_true, y_pred):
+            beta = 0.8
+            loss = K.mean(K.square(y_true - y_pred)) + beta * K.mean(y_true - y_pred)
+            return loss
+        
+        def custom_loss_2(y_true, y_pred):  # y = | sin(pi * x) | 함수를 사용해 0.5, 1.5, 2.5 ... 근처의 예측값은 penalty 를 주는 함수
+            diff = y_true - y_pred
+            mse = K.mean(K.square(y_true - y_pred))
+            penalty = K.abs(K.sin(3.1415926535 * diff)) * 0.1
+            loss = mse + penalty
+            return loss
+        
+        
+        # 과적합을 줄이기 위해 kfold 학습
+        n_fold = 5
+        skf = StratifiedKFold(n_splits=n_fold, shuffle=True)
+        
+             
+        #모델 설계
+        model = Sequential()
+        model.add(Dense(24, input_dim=n_features, activation='relu'))
+        #model.add(BatchNormalization())
+        model.add(Dense(10, activation='relu'))
+        #model.add(BatchNormalization())
+        #model.add(Dense(52, activation='relu'))
+        model.add(Dense(1, activation=custom_activation))
+        model.compile(loss="mse", optimizer='sgd')
+        history = model.fit(X, Y_obj, epochs=160, batch_size=64, verbose=1,
+                            validation_data = (validation_X, validation_Y))
+        print(model.summary())        
+        
+        #history 내용 확인
+        #print(history.history)
+        
+        #학습된 모델을 파일로 저장 (deep learning 모델이 커서 pickle 저장이 안 되어 대신 .h5 로 저장)
+        filename = model_type + "_finalized_model.h5"
+        model.save(filename)
+
+        #print("metric_names: ", model.metrics_names) #model.evaluate 이 return 하는 내용 확인
+        #print(F"\n{n_fold} fold losses:", '\n', loss_array)
+        #print(F"{n_fold} fold accuracy on validation set: ", '\n', accuracy_on_validation_array)
+
+        # 0. 학습 history 시각화 (loss vs val_loss)
+        fig, loss_ax = plt.subplots()
+
+        #acc_ax = loss_ax.twinx()
+
+        loss_ax.plot(history.history['loss'], 'r', label = 'train loss')
+        loss_ax.plot(history.history['val_loss'], 'b', label = 'validation loss')
+
+        loss_ax.set_xlabel('epoch')
+        loss_ax.set_ylabel('loss')
+
+        loss_ax.legend(loc = 'upper right')
+
+        plt.show()
+        
+        # 1. validation set 에 대한 예측 결과 분석
+        Y_pred = model.predict(validation_X).flatten()
+        print("************ Test Set 에 대한 예측 결과 ************")
+        display_result(validation_Y, Y_pred)
+
+
+        # 2. 학습 세트에 대한 예측 결과 분석
+        Y_pred = model.predict(X).flatten()
+        print("************ 학습 데이터 에 대한 예측 결과 ************")
+        display_result(Y_obj, Y_pred) 
+
+        return       
+
+
+    elif (model_type == "decision tree"):
+    #Decision Tree 를 만들어 Graphviz로 출력    
+        from sklearn.tree import DecisionTreeClassifier
+        from sklearn.tree import export_graphviz
+        from IPython.display import Image
+        import pydotplus
+
+        # feature 와 target 을 분리 (마지막 column 이 target 이라고 전제)
+        dataset = df.values
+        X = dataset[:,0:(n_columns-1)]
+        Y_obj = dataset[:, n_columns-1]
+        
+        #Decision Tree 학습
+        dt_clf = DecisionTreeClassifier(max_depth = 4)    # 실행 시간을 줄이기 위해 max_depth = 4 로 설정
+        dt_clf.fit(X, Y_obj)
+        
+        #Graphviz 를 활용해 분류과정 시각화
+        dot_data = export_graphviz(dt_clf, out_file = None, class_names = ['0', '1', '2'],
+                                   feature_names = df.columns[:n_columns-1], impurity=True, filled=True)
+        
+        graph = pydotplus.graph_from_dot_data(dot_data)
+        Image(graph.create_png()) #그래프 출력
+        graph.write_png("decision_tree.png")
+        
+    else:
+        print("Please designate a model to train")
+        return
+    
+
+def data_preprocessing(data):
+    
+    #결측치 NaN으로 처리 (직업 컬럼에만 결측치가 있음)
+    data.fillna('n/a', inplace=True) 
+
+    # FLAG_MOBIL 삭제:모든 값이 1로 동일
+    data.drop(['FLAG_MOBIL'], axis=1, inplace=True)
+
+    # DAYS_EMPLOYED가 양수인 데이터는 Pensioner 중 미고용 상태인 사람들이므로 35년에 해당하는 값을 넣어줌
+    data['DAYS_EMPLOYED'] = data['DAYS_EMPLOYED'].map(lambda x: (-35*365.25) if x > 0 else x)
+
+    # 음수값 -> 양수 변환
+    feats = ['DAYS_BIRTH', 'begin_month', 'DAYS_EMPLOYED']
+    for feat in feats:
+        data[feat]=np.abs(data[feat])
+
+    # 순소득 추정을 위한 파생변수
+    #data['income_per_family'] = data['income_total'] / data['family_size']
+    #data['income_per_child'] = data['income_total'] / (data['child_num'] + 1)
+    #data['work_ratio'] = data['DAYS_EMPLOYED'] / (data['DAYS_BIRTH'] - data['DAYS_EMPLOYED'])
+
+    # 초기 조건 추정을 위한 파생변수
+    #data['age_before_card'] = data['DAYS_BIRTH']/365.25 - data['begin_month']/12
+    #df['emp_before_card'] = df['DAYS_EMPLOYED']/365.25 - df['begin_month']/12
+    #df['incometotal_before_card'] = ( df['DAYS_EMPLOYED']/365.25 - df['begin_month']/12 ) * df['income_total']
+    df['yearlyincome_before_card'] = (( df['DAYS_EMPLOYED']/365.25 - df['begin_month']/12 ) * df['income_total']) \
+                                    / (data['DAYS_BIRTH']/365.25 - data['begin_month']/12)
+
+
+    # 범주형 feature 삭제
+    #data.drop(columns = ['gender'], inplace = True)
+    #data.drop(columns = ['edu_type'], inplace = True)
+    #data.drop(columns = ['family_type'], inplace = True)
+    #data.drop(columns = ['house_type'], inplace = True)
+    #data.drop(columns = ['occyp_type'], inplace = True)
+    #data.drop(columns = ['phone'], inplace = True)
+    #data.drop(columns = ['work_phone'], inplace = True)
+    #data.drop(columns = ['email'], inplace = True)
+
+    # 범주형 feature 다 삭제하기
+    #data.drop(columns = data.select_dtypes(include = ['object']).columns, inplace=True)
+    #data.drop(columns=['email', 'phone', 'work_phone'], inplace=True)
+    
+    #연소득 / 지출 비율 관련 파생변수 생성
+    #data["income_spending_ratio"] = data["income_total"] * (data["DAYS_EMPLOYED"] / 365.25) \
+    #                                / (data["child_num"] + 1) \
+    #                                / ((data["DAYS_BIRTH"] - data["DAYS_EMPLOYED"]) * 365.25)
+
+    
+    # income_spending_ratio 와 income_type, family_type, house_type, begin_month 를 빼고 모두 삭제
+    #data.drop(columns = ['child_num', 'income_total', 'DAYS_BIRTH', 'DAYS_EMPLOYED', 'work_phone',
+    #                     'phone', 'email', 'family_size', 'gender', 'car', 'reality', 'edu_type',
+    #                     'occyp_type', 'counts'], inplace = True)
+
+
+
+
+    # feature importance 가 가장 낮은 범주형 데이터를 빼 보기
+    #data.drop(columns = ['occyp_type', 'edu_type', 'house_type', 'family_type', 'email'], inplace = True)
+
+        
+    ############### -------------------------------파생변수-------------------------------- ####################    
+    # before_EMPLOYED: 고용되기 전까지의 일수
+    #data['before_EMPLOYED'] = data['DAYS_BIRTH'] - data['DAYS_EMPLOYED']
+    #data['income_total_befofeEMP_ratio'] = data['income_total'] / data['before_EMPLOYED']
+
+    #DAYS_BIRTH 파생변수- Age(나이), 태어난 월, 태어난 주(출생연도의 n주차)
+    #data['Age'] = data['DAYS_BIRTH'] // 365
+    #data['DAYS_BIRTH_m'] = np.floor(data['DAYS_BIRTH'] / 30) - ((np.floor(data['DAYS_BIRTH'] / 30) / 12).astype(int) * 12)
+    #data['DAYS_BIRTH_w'] = np.floor(data['DAYS_BIRTH'] / 7) - ((np.floor(data['DAYS_BIRTH'] / 7) / 4).astype(int) * 4)
+
+
+    #DAYS_EMPLOYED_m 파생변수- EMPLOYED(근속연수), DAYS_EMPLOYED_m(고용된 달) ,DAYS_EMPLOYED_w(고용된 주(고용연도의 n주차))  
+    #data['EMPLOYED'] = data['DAYS_EMPLOYED'] // 365
+    #data['DAYS_EMPLOYED_m'] = np.floor(data['DAYS_EMPLOYED'] / 30) - ((np.floor(data['DAYS_EMPLOYED'] / 30) / 12).astype(int) * 12)
+    #data['DAYS_EMPLOYED_w'] = np.floor(data['DAYS_EMPLOYED'] / 7) - ((np.floor(data['DAYS_EMPLOYED'] / 7) / 4).astype(int) * 4)
+
+    #ability: 소득/(살아온 일수+ 근무일수)
+    #data['ability'] = data['income_total'] / (data['DAYS_BIRTH'] + data['DAYS_EMPLOYED'])
+
+    #income_mean: 소득/ 가족 수
+    #data['income_mean'] = data['income_total'] / data['family_size']
+    #------------------------------------------------------------------------------------------------------#   
+    
+    
+    #다중공선성 제거
+#    cols = ['child_num', 'DAYS_BIRTH', 'DAYS_EMPLOYED']
+#    data.drop(cols, axis=1, inplace=True)
+    
+    
+    
+    #------ MinMaxScaler() -------#
+    #print(data.dtypes)
+    num_columns = data.select_dtypes(include = ['number']).copy()  # dtype 이 object 인 컬럼만 모아서 새 dataframe 생성
+    num_columns.drop(columns = ['credit'], inplace= True)  # target인 credit 은 여기서 scale 하지 않을것이므로 drop
+    #print("numerical value columns: \n", num_columns)
+    
+    trans = MinMaxScaler()    # MinMax 로 scaling
+    data_scaled = trans.fit_transform(num_columns.values)    
+
+    data[num_columns.columns] = data_scaled
+    #----------------------------#
+    
+    #print(data.dtypes)
+    
+    #------ 1 hot encoding-------#
+    object_col = []
+    for col in data.columns:
+        if data[col].dtype == 'object':
+            object_col.append(col)
+            
+    enc = OneHotEncoder()
+    enc.fit(data.loc[:,object_col])
+
+
+    data_onehot_df = pd.DataFrame(enc.transform(data.loc[:,object_col]).toarray(), 
+                 columns=enc.get_feature_names(object_col))
+    data.drop(object_col, axis=1, inplace=True)
+    data = pd.concat([data, data_onehot_df], axis=1)
+     #----------------------------#
+        
+    return data
+
+
+# 여기부터 코드 main part
+df = pd.read_csv("traindata_valuecounts_20211002.csv", encoding='utf-8')
+#df = drop_index(df)
+
+# 모델 학습시 부여 할 class 가중치를 계산
+from sklearn.utils.class_weight import compute_class_weight
+weight = compute_class_weight('balanced', np.unique(df['credit']), df['credit'])
+weight = {i: weight[i] for i in range(3)}
+print(weight)
+
+# 전처리 함수 호출
+df = data_preprocessing(df)
+
+
+df, validation_X, validation_Y = get_train_data(df, test_ratio = 0.2)
+
+
+print("\n=============== Data to be used for this deep learning: ===============\n", df)
+
+train_model(df, model_type = "deep value")
+
